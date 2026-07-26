@@ -1,0 +1,9 @@
+{
+  "timestamp": "2026-07-26 18:20:32",
+  "duration_seconds": 79.4,
+  "good_posture_percent": 100.0,
+  "bad_posture_percent": 0.0,
+  "eye_contact_percent": 94.0,
+  "average_confidence_score": 92.6,
+  "posture_corrections": 0
+}

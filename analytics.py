@@ -16,6 +16,7 @@ import json
 import os
 
 import config
+import incident_logger
 
 
 def load_sessions():
@@ -49,6 +50,21 @@ def main():
         print(f"  Posture:     {first['good_posture_percent']:.1f}% -> {last['good_posture_percent']:.1f}%")
         print(f"  Eye contact: {first['eye_contact_percent']:.1f}% -> {last['eye_contact_percent']:.1f}%")
         print(f"  Confidence:  {first['average_confidence_score']:.1f} -> {last['average_confidence_score']:.1f}")
+
+    # ---------------- Incident history (from incidents.db) ----------------
+    incident_logger.init_db()
+    total = incident_logger.total_count()
+    if total:
+        print(f"\n----- Incident History ({total} total logged) -----")
+        print(f"{'Type':<20}{'Count':<8}")
+        for row in incident_logger.counts_by_type():
+            print(f"{row[0]:<20}{row[1]:<8}")
+
+        print("\nMost recent 10 incidents:")
+        for inc in incident_logger.fetch_recent(10):
+            print(f"  [{inc['timestamp']}] {inc['type']}: {inc['message']}")
+    else:
+        print("\nNo incidents logged yet.")
 
     try:
         import matplotlib.pyplot as plt

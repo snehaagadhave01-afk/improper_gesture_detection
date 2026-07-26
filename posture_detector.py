@@ -1,19 +1,27 @@
 """
 posture_detector.py
 --------------------
-Front-camera-friendly posture check, calibrated to you.
+Calibrated posture check, using MediaPipe Pose's real depth (Z) data --
+not just 2D pixel positions -- so forward leaning is detected directly
+instead of being inferred (and sometimes masked) from 2D proxies.
 
-Consumes Pose landmarks produced once per frame by pose_engine.PoseEngine
-(shared with body_language_detector.py) -- no model of its own.
+MediaPipe Pose gives each landmark an x, y, AND z. z is depth relative
+to your hips: more negative = closer to the camera than your hips.
+That's exactly the signal for "are you leaning toward the screen."
 
-  torso_len       = shoulder-mid to hip-mid vertical distance
-                     (shrinks when you lean/bend forward -- "slouching")
-  neck_len        = nose to shoulder-mid vertical distance
-                     (shrinks when your head drops -- "bent neck")
-  shoulder_tilt   = angle of the shoulder line from horizontal
-                     ("uneven shoulders")
-  lateral_offset  = sideways offset of your torso from your hips
-                     ("leaning too much" to one side)
+  shoulder_depth   = how far forward your shoulders are vs your hips
+                      (more negative than your calibrated baseline =
+                      leaning/bending forward -- "slouching")
+  neck_torso_ratio = neck length (nose-to-shoulder) divided by torso
+                      length (shoulder-to-hip), in pixels. This ratio
+                      is automatically scale-invariant (both shrink/grow
+                      together as you move closer/farther from camera),
+                      so it isolates real head-drop -- "bent neck"
+  shoulder_tilt    = angle of the shoulder line from horizontal
+                      ("uneven shoulders")
+  lateral_offset   = sideways offset of your torso from your hips,
+                      normalized by shoulder width ("leaning too much"
+                      to one side)
 """
 
 import math
@@ -30,16 +38,16 @@ class PostureReading:
     hip_mid_px: Tuple[int, int]
     left_shoulder_px: Tuple[int, int]
     right_shoulder_px: Tuple[int, int]
-    torso_len: float
-    neck_len: float
+    shoulder_depth: float
+    neck_torso_ratio: float
     shoulder_tilt_deg: float
     lateral_offset: float
 
 
 class PostureDetector:
     def __init__(self):
-        self.baseline_torso: Optional[float] = None
-        self.baseline_neck: Optional[float] = None
+        self.baseline_depth: Optional[float] = None
+        self.baseline_ratio: Optional[float] = None
         self.baseline_lateral: Optional[float] = None
         self._calib_samples: List[Tuple[float, float, float]] = []
 
@@ -63,16 +71,18 @@ class PostureDetector:
         shoulder_mid = ((l_sh[0] + r_sh[0]) / 2, (l_sh[1] + r_sh[1]) / 2)
         hip_mid = ((l_hip[0] + r_hip[0]) / 2, (l_hip[1] + r_hip[1]) / 2)
 
+        # Real depth: MediaPipe's z is relative to the hip midpoint --
+        # more negative shoulder z means your shoulders are closer to
+        # the camera than your hips, i.e. you're leaning forward.
+        shoulder_depth = (lm[P.LEFT_SHOULDER].z + lm[P.RIGHT_SHOULDER].z) / 2
+
+        torso_len_px = hip_mid[1] - shoulder_mid[1]
+        neck_len_px = shoulder_mid[1] - nose[1]
+        neck_torso_ratio = neck_len_px / (torso_len_px if abs(torso_len_px) > 1e-3 else 1e-3)
+
         dx, dy = r_sh[0] - l_sh[0], r_sh[1] - l_sh[1]
-        shoulder_width = math.hypot(dx, dy) or 1.0
-
-        # Normalized by shoulder width so moving closer/farther from the
-        # camera doesn't mask real bending -- only the SHAPE of your
-        # posture matters, not how big you appear in the frame.
-        torso_len = (hip_mid[1] - shoulder_mid[1]) / shoulder_width
-        neck_len = (shoulder_mid[1] - nose[1]) / shoulder_width
-
         shoulder_tilt = math.degrees(math.atan2(dy, dx))
+        shoulder_width = math.hypot(dx, dy) or 1.0
         lateral_offset = (shoulder_mid[0] - hip_mid[0]) / shoulder_width
 
         return PostureReading(
@@ -81,34 +91,34 @@ class PostureDetector:
             hip_mid_px=(int(hip_mid[0]), int(hip_mid[1])),
             left_shoulder_px=(int(l_sh[0]), int(l_sh[1])),
             right_shoulder_px=(int(r_sh[0]), int(r_sh[1])),
-            torso_len=torso_len,
-            neck_len=neck_len,
+            shoulder_depth=shoulder_depth,
+            neck_torso_ratio=neck_torso_ratio,
             shoulder_tilt_deg=shoulder_tilt,
             lateral_offset=lateral_offset,
         )
 
     # ---------------------- Calibration ----------------------
     def add_calibration_sample(self, reading: PostureReading):
-        self._calib_samples.append((reading.torso_len, reading.neck_len, reading.lateral_offset))
+        self._calib_samples.append((reading.shoulder_depth, reading.neck_torso_ratio, reading.lateral_offset))
 
     def finalize_calibration(self) -> bool:
         if not self._calib_samples:
             return False
         n = len(self._calib_samples)
-        self.baseline_torso = sum(t for t, _, _ in self._calib_samples) / n
-        self.baseline_neck = sum(nk for _, nk, _ in self._calib_samples) / n
+        self.baseline_depth = sum(d for d, _, _ in self._calib_samples) / n
+        self.baseline_ratio = sum(r for _, r, _ in self._calib_samples) / n
         self.baseline_lateral = sum(l for _, _, l in self._calib_samples) / n
         self._calib_samples = []
         return True
 
     def reset_calibration(self):
-        self.baseline_torso = None
-        self.baseline_neck = None
+        self.baseline_depth = None
+        self.baseline_ratio = None
         self.baseline_lateral = None
         self._calib_samples = []
 
     def is_calibrated(self) -> bool:
-        return self.baseline_torso is not None and self.baseline_neck is not None
+        return self.baseline_depth is not None and self.baseline_ratio is not None
 
     def calibration_progress(self) -> int:
         return len(self._calib_samples)
@@ -120,14 +130,14 @@ class PostureDetector:
             return []
 
         issues = []
-        torso_ratio = reading.torso_len / self.baseline_torso
-        neck_ratio = reading.neck_len / self.baseline_neck
+        depth_delta = reading.shoulder_depth - self.baseline_depth   # more negative = leaning forward
+        ratio_change = reading.neck_torso_ratio / self.baseline_ratio if self.baseline_ratio else 1.0
         tilt = abs(reading.shoulder_tilt_deg)
         lateral_dev = abs(reading.lateral_offset - self.baseline_lateral)
 
-        if torso_ratio < config.TORSO_RATIO_THRESHOLD:
+        if depth_delta < -config.FORWARD_LEAN_THRESHOLD:
             issues.append(("slouching", "You're bending forward - sit up straight"))
-        if neck_ratio < config.NECK_RATIO_THRESHOLD:
+        if ratio_change < config.NECK_TORSO_RATIO_THRESHOLD:
             issues.append(("bent_neck", "Your head is drooping - lift your head up"))
         if tilt > config.SHOULDER_TILT_THRESHOLD:
             issues.append(("uneven_shoulders", "Keep both shoulders level"))

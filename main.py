@@ -23,6 +23,10 @@ import mediapipe as mp
 
 import config
 import scoring
+import incident_logger
+import alerts
+import preprocessing
+import person_grouping
 from pose_engine import PoseEngine
 from face_engine import FaceEngine
 from posture_detector import PostureDetector
@@ -49,7 +53,7 @@ def get_gesture_for_hand(hand_result, ml_classifier):
     return hand_result.gesture
 
 
-def draw_hand(frame, hand_result, gesture):
+def draw_hand(frame, hand_result, gesture, person_label=None):
     mp_hands = mp.solutions.hands
     points = hand_result.landmarks_px
     for start_idx, end_idx in mp_hands.HAND_CONNECTIONS:
@@ -57,12 +61,13 @@ def draw_hand(frame, hand_result, gesture):
     for x, y in points:
         cv2.circle(frame, (x, y), 4, config.LANDMARK_COLOR, -1)
     wrist_x, wrist_y = points[0]
+    prefix = f"{person_label} - " if person_label else ""
     if gesture:
         color = config.IMPROPER_COLOR if gesture["improper"] else config.NORMAL_COLOR
-        text = f"{hand_result.handedness}: {gesture['label']}"
+        text = f"{prefix}{hand_result.handedness}: {gesture['label']}"
     else:
         color = config.NORMAL_COLOR
-        text = f"{hand_result.handedness}: Unknown gesture"
+        text = f"{prefix}{hand_result.handedness}: Unknown gesture"
     cv2.putText(frame, text, (wrist_x - 40, wrist_y + 40), FONT, 0.6, color, 2)
 
 
@@ -74,26 +79,10 @@ def draw_posture_skeleton(frame, reading, color):
         cv2.circle(frame, p, 6, color, -1)
 
 
-def draw_alert_panel(frame, alerts):
-    h, w = frame.shape[:2]
-    if not alerts:
-        cv2.rectangle(frame, (0, 0), (w, config.BANNER_HEIGHT), (40, 40, 40), -1)
-        cv2.putText(
-            frame, "Status: All good - Monitoring...",
-            (20, int(config.BANNER_HEIGHT * 0.65)),
-            FONT, 0.7, (200, 200, 200), 2,
-        )
-        return
-
-    for i, (message, color) in enumerate(alerts[:4]):
-        y1 = i * config.BANNER_HEIGHT
-        y2 = y1 + config.BANNER_HEIGHT
-        cv2.rectangle(frame, (0, y1), (w, y2), color, -1)
-        cv2.putText(
-            frame, f"! {message}",
-            (20, y1 + int(config.BANNER_HEIGHT * 0.65)),
-            FONT, 0.65, (255, 255, 255), 2,
-        )
+def draw_status_line(frame, text, color):
+    """Small, unobtrusive status line -- calibration progress or live debug numbers."""
+    cv2.rectangle(frame, (0, 0), (frame.shape[1], 30), (25, 25, 25), -1)
+    cv2.putText(frame, text, (10, 20), FONT, 0.5, color, 1)
 
 
 def draw_big_warning(frame, message, color):
@@ -119,41 +108,10 @@ def draw_big_warning(frame, message, color):
     cv2.putText(frame, text, (text_x, text_y), FONT, font_scale, (255, 255, 255), thickness)
 
 
-def draw_scoreboard(frame, scores):
-    h, w = frame.shape[:2]
-    panel_w, line_h = 260, 28
-    x0, y0 = w - panel_w - 10, 10
-    cv2.rectangle(frame, (x0, y0), (w - 10, y0 + line_h * 4 + 16), (30, 30, 30), -1)
-
-    def color_for(v):
-        if v >= 75:
-            return (0, 200, 0)
-        if v >= 50:
-            return (0, 165, 255)
-        return (0, 0, 255)
-
-    labels = [
-        ("Confidence", scores["confidence"]),
-        ("Eye Contact", scores["eye_contact"]),
-        ("Posture", scores["posture"]),
-        ("Professionalism", scores["professionalism"]),
-    ]
-    for i, (label, value) in enumerate(labels):
-        y = y0 + 24 + i * line_h
-        cv2.putText(frame, f"{label}: {value}%", (x0 + 12, y), FONT, 0.55, color_for(value), 2)
-
-
-def draw_suggestions(frame, suggestions):
-    if not suggestions:
-        return
-    h, w = frame.shape[:2]
-    text = "Tip: " + "  |  ".join(suggestions)
-    cv2.putText(frame, text, (20, h - 15), FONT, 0.55, (255, 255, 255), 2)
-
-
 def main():
     if config.SAVE_SNAPSHOTS and not os.path.exists(config.SNAPSHOT_DIR):
         os.makedirs(config.SNAPSHOT_DIR)
+    incident_logger.init_db()
 
     cap = cv2.VideoCapture(config.CAMERA_INDEX)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.FRAME_WIDTH)
@@ -193,6 +151,7 @@ def main():
     face_touch_confirm = 0
     last_face_touch_alert_time = 0.0
     last_movement_alert_time = 0.0
+    last_posture_alert_time = 0.0
     last_break_reminder_slot = 0
     eye_contact_running_score = 100
 
@@ -208,6 +167,7 @@ def main():
         if config.FLIP_HORIZONTAL:
             frame = cv2.flip(frame, 1)
 
+        frame = preprocessing.enhance_frame(frame)
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w = frame.shape[:2]
         now = time.time()
@@ -222,25 +182,41 @@ def main():
 
         # ---------- Hand gestures (optional, off by default) ----------
         if config.ENABLE_HAND_DETECTION:
+            person_ids = person_grouping.assign_person_ids(hand_results, w, config.PERSON_CLUSTER_DISTANCE_RATIO)
             seen_this_frame = set()
-            gesture_alert = False
-            for hand_result in hand_results:
+            alerted_people = set()
+
+            for hand_result, pid in zip(hand_results, person_ids):
                 gesture = get_gesture_for_hand(hand_result, ml_classifier)
-                draw_hand(frame, hand_result, gesture)
+                person_label = f"Person {pid + 1}"
+                draw_hand(frame, hand_result, gesture, person_label=person_label)
+
                 if gesture and gesture["improper"]:
-                    key = f"{hand_result.handedness}_{gesture['name']}"
+                    key = f"P{pid}_{hand_result.handedness}_{gesture['name']}"
                     seen_this_frame.add(key)
                     confirm_counters[key] += 1
                     if confirm_counters[key] >= config.CONFIRM_FRAMES:
-                        gesture_alert = True
+                        alerted_people.add((pid, key))
                         if now - last_alert_time[key] >= config.ALERT_COOLDOWN_SECONDS:
                             last_alert_time[key] = now
-                            print(f"[ALERT] Improper gesture confirmed: {key}")
+                            print(f"[ALERT] Improper gesture confirmed: {person_label} ({hand_result.handedness}, {gesture['name']})")
+                            fname = None
+                            if config.SAVE_SNAPSHOTS:
+                                fname = os.path.join(config.SNAPSHOT_DIR, f"improper_{int(now)}.jpg")
+                                cv2.imwrite(fname, frame)
+                            incident_logger.log_incident(
+                                "improper_gesture", f"{person_label}: {key}", fname
+                            )
+                            alerts.maybe_send_email_alert(
+                                "improper_gesture", f"Improper gesture detected - {person_label} ({key})"
+                            )
+
             for key in list(confirm_counters.keys()):
                 if key not in seen_this_frame:
                     confirm_counters[key] = 0
-            if gesture_alert:
-                active_alerts.append(("Improper gesture detected!", config.IMPROPER_COLOR))
+
+            for pid, _ in sorted(alerted_people):
+                active_alerts.append((f"Person {pid + 1}: Improper gesture detected!", config.IMPROPER_COLOR))
 
         # ---------- Readings (posture + head) ----------
         posture_reading = (
@@ -265,21 +241,32 @@ def main():
         posture_ready = posture_detector is None or posture_detector.is_calibrated()
         head_ready = head_detector is None or head_detector.is_calibrated()
 
+        calibration_status = None
         if posture_detector is not None and not posture_detector.is_calibrated():
             pct = int(100 * posture_detector.calibration_progress() / config.CALIBRATION_FRAMES)
-            active_alerts.append((f"Calibrating posture... sit straight ({pct}%)", (180, 120, 0)))
+            calibration_status = f"Calibrating posture... sit straight ({pct}%)"
         if head_detector is not None and not head_detector.is_calibrated():
             pct = int(100 * head_detector.calibration_progress() / config.CALIBRATION_FRAMES)
-            active_alerts.append((f"Calibrating eye contact... look at camera ({pct}%)", (180, 120, 0)))
+            eye_status = f"Calibrating eye contact... look at camera ({pct}%)"
+            calibration_status = f"{calibration_status} | {eye_status}" if calibration_status else eye_status
 
         # ---------- Posture ----------
         posture_issues = []
+        posture_debug = None
         if posture_ready and posture_detector is not None and posture_reading is not None:
             posture_issues = posture_detector.classify(posture_reading)
             color = config.POSTURE_BAD_COLOR if posture_issues else config.POSTURE_GOOD_COLOR
             draw_posture_skeleton(frame, posture_reading, color)
             for _, message in posture_issues:
                 active_alerts.append((message, POSTURE_ALERT_COLOR))
+            if posture_issues and now - last_posture_alert_time >= config.POSTURE_ALERT_COOLDOWN_SECONDS:
+                last_posture_alert_time = now
+                combined = "; ".join(message for _, message in posture_issues)
+                print(f"[ALERT] Posture: {combined}")
+                incident_logger.log_incident("posture", combined)
+            lean = posture_reading.shoulder_depth - posture_detector.baseline_depth
+            neck_ratio = posture_reading.neck_torso_ratio / posture_detector.baseline_ratio
+            posture_debug = f"Lean: {lean:+.3f} (bad if < -{config.FORWARD_LEAN_THRESHOLD}) | Neck: {neck_ratio:.2f} (bad if < {config.NECK_TORSO_RATIO_THRESHOLD})"
         elif posture_reading is not None:
             draw_posture_skeleton(frame, posture_reading, config.POSTURE_GOOD_COLOR)
 
@@ -308,6 +295,8 @@ def main():
                 if now - last_visibility_alert_time >= config.VISIBILITY_COOLDOWN_SECONDS:
                     last_visibility_alert_time = now
                     print("[ALERT] Person not visible in frame.")
+                    incident_logger.log_incident("not_visible", "Person not visible in frame")
+                    alerts.maybe_send_email_alert("not_visible", "Person is not visible in the camera frame")
 
         # ---------- Face touch ----------
         face_touch_active = False
@@ -323,6 +312,7 @@ def main():
                 if now - last_face_touch_alert_time >= config.FACE_TOUCH_COOLDOWN_SECONDS:
                     last_face_touch_alert_time = now
                     print("[ALERT] Hand near mouth/eyes - avoid touching your face.")
+                    incident_logger.log_incident("face_touch", "Hand near mouth/eyes")
 
         # ---------- General movement ----------
         if config.ENABLE_MOVEMENT_CHECK and movement_monitor is not None:
@@ -332,21 +322,12 @@ def main():
                 if now - last_movement_alert_time >= config.MOVEMENT_COOLDOWN_SECONDS:
                     last_movement_alert_time = now
                     print("[ALERT] Excessive movement detected.")
+                    incident_logger.log_incident("movement", "Excessive/unwanted movement detected")
 
-        # ---------- Scores ----------
+        # ---------- Scores (used for session report, not shown on screen) ----------
         p_score = scoring.posture_score(posture_issues)
         prof_score = scoring.professionalism_score(body_issues, face_touch_active)
         conf_score = scoring.confidence_score(p_score, eye_contact_running_score, prof_score, config.SCORE_WEIGHTS)
-        scores = {
-            "posture": p_score,
-            "eye_contact": eye_contact_running_score,
-            "professionalism": prof_score,
-            "confidence": conf_score,
-        }
-        draw_scoreboard(frame, scores)
-
-        suggestions = scoring.generate_suggestions(posture_issues, head_issues, body_issues, face_touch_active)
-        draw_suggestions(frame, suggestions)
 
         # ---------- Break reminder (continuous sitting time) ----------
         elapsed_min = (now - session.start_time) / 60
@@ -356,7 +337,12 @@ def main():
             active_alerts.append((f"You've been at this {int(elapsed_min)} min - take a short break!", BREAK_COLOR))
             print("[INFO] Break reminder triggered.")
 
-        draw_alert_panel(frame, active_alerts)
+        # ---------- On-screen display: keep it minimal ----------
+        if calibration_status:
+            draw_status_line(frame, calibration_status, (0, 200, 255))
+        elif posture_debug:
+            draw_status_line(frame, posture_debug, (180, 180, 180))
+
         if active_alerts:
             top_message, top_color = active_alerts[0]
             draw_big_warning(frame, top_message, top_color)
