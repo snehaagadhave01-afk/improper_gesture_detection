@@ -45,3 +45,18 @@ Python, OpenCV, MediaPipe (Pose + FaceMesh + Hands), SQLite
 - Full multi-person body tracking
 - Web dashboard
 - SMS alerts
+
+## Screenshots
+
+### FaceTouchAlert
+![FaceTouchAlert](Screenshots/FaceTouchAlert.png)
+
+### FrameAlert
+![FrameAlert](Screenshots/FrameAlert.png)
+
+### Alerts
+![Alerts](Screenshots/Alerts.png)
+
+### sessionReport
+![sessionReport](Screenshots/sessionReport.png)
+
