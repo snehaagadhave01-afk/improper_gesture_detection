@@ -52,10 +52,10 @@ Python, OpenCV, MediaPipe (Pose + FaceMesh + Hands), SQLite
 ![FaceTouchAlert](FaceTouchAlert.png)
 
 ### FrameAlert
-![FrameAlert](FrameAlert.png)
+![FrameAlert](frameAlert.png)
 
 ### Alerts
-![Alerts](Alerts.png)
+![Alerts](alerts.png)
 
 ### sessionReport
 ![sessionReport](sessionReport.png)
