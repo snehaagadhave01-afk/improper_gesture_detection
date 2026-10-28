@@ -35,10 +35,6 @@ It calibrates to YOUR normal posture and gaze for the first ~1.5 seconds (sit st
 ## Tech Used
 Python, OpenCV, MediaPipe (Pose + FaceMesh + Hands), SQLite
 
-## Limitations
-- Eye contact tracking is a smart approximation, not true 3D gaze tracking
-- Works best with one main person for posture/eye contact (hand gestures support multiple people)
-- Gesture recognition is rule-based by default; can be swapped for a trained ML model
 
 ## Future Ideas
 - Train a custom deep learning model for more gestures
